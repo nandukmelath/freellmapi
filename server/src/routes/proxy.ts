@@ -13,6 +13,7 @@ import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandoff, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
+import { parseCacheDirective, cacheActive, isCacheableTemperature, computeCacheKey, getCachedResponse, storeCachedResponse } from '../services/cache.js';
 
 export const proxyRouter = Router();
 
@@ -456,6 +457,41 @@ proxyRouter.post('/embeddings', async (req: Request, res: Response) => {
   }
 });
 
+// Replay a cached chat.completion as a Server-Sent Events stream, so a streaming
+// client gets the same wire format it asked for on a cache hit. The cached body
+// is a complete (non-streamed) completion; we fan it out into the minimal chunk
+// sequence OpenAI clients expect: role delta → content delta → tool_calls delta
+// → terminal finish_reason → [DONE].
+function replayCachedCompletion(res: Response, body: any, routedVia: string): void {
+  const choice = body?.choices?.[0] ?? {};
+  const message = choice.message ?? {};
+  const content: string = typeof message.content === 'string' ? message.content : '';
+  const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+  const finish = choice.finish_reason ?? (toolCalls.length > 0 ? 'tool_calls' : 'stop');
+  const id = body?.id ?? `chatcmpl-cache-${Date.now()}`;
+  const created = body?.created ?? Math.floor(Date.now() / 1000);
+  const model = body?.model ?? 'cached';
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Routed-Via', routedVia);
+  res.setHeader('X-FreeLLM-Cache', 'HIT');
+
+  const chunk = (delta: Record<string, unknown>, finish_reason: string | null) =>
+    `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta, finish_reason }] })}\n\n`;
+
+  res.write(chunk({ role: 'assistant' }, null));
+  if (content.length > 0) res.write(chunk({ content }, null));
+  if (toolCalls.length > 0) res.write(chunk({ tool_calls: toolCalls.map((c: any, i: number) => ({ index: i, ...c })) }, null));
+  res.write(chunk({}, finish));
+  if (body?.usage) {
+    res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [], usage: body.usage })}\n\n`);
+  }
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
 proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   const start = Date.now();
 
@@ -637,6 +673,42 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     return;
   }
 
+  // For analytics: the model id the client pinned, null when auto-routed
+  // ('auto' or omitted). Logged with every request row so pinned vs auto
+  // traffic and failover overrides are visible. Declared here (ahead of routing)
+  // so the cache-hit path below can tag its analytics row too.
+  const pinnedModelId = requestedModel && !isAutoModel(requestedModel) ? requestedModel : null;
+
+  // ── Response cache (services/cache.ts) ──
+  // Computed here, once messages + sampling params are normalized but before any
+  // routing/session work, so a hit short-circuits the whole pipeline. The key is
+  // the canonical request; the route that originally answered is irrelevant to
+  // the match. Disabled unless RESPONSE_CACHE is on (or forced per-request), and
+  // skipped for high-temperature requests that want fresh variety.
+  const cacheDirective = parseCacheDirective(req.headers['x-freellm-cache'], req.headers['cache-control']);
+  const cacheKey = (cacheActive(cacheDirective) && isCacheableTemperature(temperature))
+    ? computeCacheKey({ model: requestedModel, messages, temperature, top_p, max_tokens, tools, tool_choice })
+    : null;
+
+  if (cacheKey) {
+    const hit = getCachedResponse(cacheKey);
+    if (hit) {
+      const routedVia = `${hit.platform}/${hit.modelId}`;
+      // A hit consumes NO provider quota, so recordRequest/recordTokens are
+      // deliberately NOT called — only the analytics row is written, tagged with
+      // the originating route so savings still attribute correctly.
+      if (stream) {
+        replayCachedCompletion(res, hit.body, routedVia);
+      } else {
+        res.setHeader('X-Routed-Via', routedVia);
+        res.setHeader('X-FreeLLM-Cache', 'HIT');
+        res.json(hit.body);
+      }
+      logRequest(hit.platform, hit.modelId, hit.keyId ?? 0, 'success', hit.promptTokens, hit.completionTokens, Date.now() - start, null, null, pinnedModelId);
+      return;
+    }
+  }
+
   // Optional client-managed session affinity (see getSessionKey). Express
   // lower-cases header names; a repeated header arrives as an array — take
   // the first value.
@@ -686,11 +758,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   } else {
     preferredModel = getStickyModel(messages, sessionIdHeader);
   }
-
-  // For analytics: the model id the client pinned, null when auto-routed
-  // ('auto' or omitted). Logged with every request row so pinned vs auto
-  // traffic and failover overrides are visible.
-  const pinnedModelId = requestedModel && !isAutoModel(requestedModel) ? requestedModel : null;
 
   // Retry loop: on 429/rate limit, skip that model+key and try the next one
   const skipKeys = new Set<string>();
@@ -761,6 +828,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         let totalOutputTokens = 0;
         let headerSent = false;
         let ttfbMs: number | null = null;
+        // Accumulates exactly the content text emitted to the client, so a
+        // streamed answer can be cached as one complete completion at the end
+        // (the per-chunk heldText is cleared as it flushes, so we can't
+        // reconstruct it afterwards otherwise).
+        let cachedContent = '';
 
         // Hold-window state: 'undecided' until the first text either matches
         // a dialect marker (→ 'dialect': buffer everything, rescue at end) or
@@ -859,6 +931,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             totalOutputTokens += Math.ceil(text.length / 4);
 
             if (mode === 'passthrough') {
+              cachedContent += text;
               writeChunk({ ...anyChunk, choices: [{ ...choice, delta: { ...choice.delta, tool_calls: undefined }, finish_reason: null }] });
               continue;
             }
@@ -872,6 +945,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             } else if (!couldBecomeDialectMarker(probe) || probe.length > 256) {
               mode = 'passthrough';
               flushHeaders();
+              cachedContent += heldText;
               writeChunk(mkChunk({ content: heldText }, null));
               heldText = '';
             }
@@ -921,6 +995,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
           flushHeaders();
           if (heldText.length > 0) {
+            cachedContent += heldText;
             writeChunk(mkChunk({ content: heldText }, null));
           }
           if (completedCalls.length > 0) {
@@ -943,6 +1018,40 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           recordSuccess(route.modelDbId);
           setStickyModel(messages, route.modelDbId, sessionIdHeader);
           if (handoffMode !== 'off' && sessionKey) recordSuccessfulModel({ sessionKey, modelKey });
+
+          // Cache the assembled stream as one complete completion, so an
+          // identical later request — streamed OR not — can be served from
+          // cache (replayCachedCompletion fans it back out to SSE).
+          if (cacheKey && (cachedContent.length > 0 || completedCalls.length > 0)) {
+            storeCachedResponse(cacheKey, {
+              body: {
+                id: lastMeta.id ?? `chatcmpl-${Date.now()}`,
+                object: 'chat.completion',
+                created: lastMeta.created ?? Math.floor(Date.now() / 1000),
+                model: lastMeta.model ?? route.modelId,
+                choices: [{
+                  index: 0,
+                  message: {
+                    role: 'assistant',
+                    content: cachedContent.length > 0 ? cachedContent : null,
+                    ...(completedCalls.length > 0 ? { tool_calls: completedCalls } : {}),
+                  },
+                  finish_reason: finish,
+                }],
+                usage: {
+                  prompt_tokens: estimatedInputTokens + injectedHandoffTokens,
+                  completion_tokens: totalOutputTokens,
+                  total_tokens: estimatedInputTokens + injectedHandoffTokens + totalOutputTokens,
+                },
+              },
+              platform: route.platform,
+              modelId: route.modelId,
+              keyId: route.keyId,
+              promptTokens: estimatedInputTokens + injectedHandoffTokens,
+              completionTokens: totalOutputTokens,
+            });
+          }
+
           logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens + injectedHandoffTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId);
           return;
         } catch (streamErr: any) {
@@ -1028,7 +1137,23 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           }
         }
         // Normalize array-shaped message.content to a string on the way out (#166).
-        res.json(normalizeOutboundContent(result));
+        const outboundBody = normalizeOutboundContent(result);
+        res.setHeader('X-FreeLLM-Cache', cacheKey ? 'MISS' : 'OFF');
+        res.json(outboundBody);
+
+        // Cache the freshly-generated answer so an identical later request is
+        // served without spending another free-tier slot. Best-effort and
+        // post-response, so it can never delay or break the reply.
+        if (cacheKey) {
+          storeCachedResponse(cacheKey, {
+            body: outboundBody,
+            platform: route.platform,
+            modelId: route.modelId,
+            keyId: route.keyId,
+            promptTokens: result.usage?.prompt_tokens ?? 0,
+            completionTokens: result.usage?.completion_tokens ?? 0,
+          });
+        }
 
         logRequest(
           route.platform, route.modelId, route.keyId, 'success',

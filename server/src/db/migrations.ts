@@ -128,6 +128,29 @@ function createTables(db: Database.Database) {
       value TEXT NOT NULL
     );
 
+    -- Response cache: exact-match completion cache (services/cache.ts). A cache
+    -- hit is served WITHOUT touching any provider, so it costs zero free-tier
+    -- quota and returns instantly — the whole point of a free-tier-stacking
+    -- proxy is to make scarce quota go further, and re-asking an identical
+    -- prompt is pure waste. Keyed by a SHA-256 of the canonical request (model
+    -- field + normalized messages + sampling params + tools). Opt-in via the
+    -- RESPONSE_CACHE env var; entries expire by TTL and are capped by count.
+    -- platform/model_id/key_id record which route originally produced the answer
+    -- for analytics attribution only — they are NOT part of the key (any model's
+    -- good answer to an identical prompt is a valid hit).
+    CREATE TABLE IF NOT EXISTS response_cache (
+      cache_key TEXT PRIMARY KEY,
+      response_json TEXT NOT NULL,
+      platform TEXT NOT NULL,
+      model_id TEXT NOT NULL,
+      key_id INTEGER,
+      prompt_tokens INTEGER NOT NULL DEFAULT 0,
+      completion_tokens INTEGER NOT NULL DEFAULT 0,
+      hit_count INTEGER NOT NULL DEFAULT 0,
+      created_at_ms INTEGER NOT NULL,
+      last_hit_at_ms INTEGER
+    );
+
     -- Dashboard accounts (email + password) gating the /api/* admin surface (#35).
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -149,6 +172,7 @@ function createTables(db: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_rate_limit_usage_lookup ON rate_limit_usage(platform, model_id, key_id, kind, created_at_ms);
     CREATE INDEX IF NOT EXISTS idx_rate_limit_cooldowns_expires ON rate_limit_cooldowns(expires_at_ms);
     CREATE INDEX IF NOT EXISTS idx_api_keys_platform ON api_keys(platform);
+    CREATE INDEX IF NOT EXISTS idx_response_cache_created ON response_cache(created_at_ms);
   `);
 
   ensureRequestKeyIdColumn(db);
