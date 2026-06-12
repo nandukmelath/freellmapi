@@ -13,7 +13,7 @@ import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandoff, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
-import { parseCacheDirective, cacheActive, isCacheableTemperature, computeCacheKey, getCachedResponse, storeCachedResponse } from '../services/cache.js';
+import { parseCacheDirective, cacheActive, isCacheableTemperature, computeCacheKey, getCachedResponse, storeCachedResponse, isSemanticEnabled, semanticFamily, computeParamsBucket, findSemanticMatch } from '../services/cache.js';
 
 export const proxyRouter = Router();
 
@@ -457,12 +457,18 @@ proxyRouter.post('/embeddings', async (req: Request, res: Response) => {
   }
 });
 
+// Flatten a conversation into one string to embed for the semantic cache.
+// Role-prefixed so "user: ping" and "assistant: ping" don't collide.
+function semanticText(messages: ChatMessage[]): string {
+  return messages.map(m => `${m.role}: ${contentToString(m.content)}`).join('\n');
+}
+
 // Replay a cached chat.completion as a Server-Sent Events stream, so a streaming
 // client gets the same wire format it asked for on a cache hit. The cached body
 // is a complete (non-streamed) completion; we fan it out into the minimal chunk
 // sequence OpenAI clients expect: role delta → content delta → tool_calls delta
 // → terminal finish_reason → [DONE].
-function replayCachedCompletion(res: Response, body: any, routedVia: string): void {
+function replayCachedCompletion(res: Response, body: any, routedVia: string, tag: 'HIT' | 'HIT-SEMANTIC' = 'HIT'): void {
   const choice = body?.choices?.[0] ?? {};
   const message = choice.message ?? {};
   const content: string = typeof message.content === 'string' ? message.content : '';
@@ -476,7 +482,7 @@ function replayCachedCompletion(res: Response, body: any, routedVia: string): vo
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Routed-Via', routedVia);
-  res.setHeader('X-FreeLLM-Cache', 'HIT');
+  res.setHeader('X-FreeLLM-Cache', tag);
 
   const chunk = (delta: Record<string, unknown>, finish_reason: string | null) =>
     `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta, finish_reason }] })}\n\n`;
@@ -686,26 +692,59 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // the match. Disabled unless RESPONSE_CACHE is on (or forced per-request), and
   // skipped for high-temperature requests that want fresh variety.
   const cacheDirective = parseCacheDirective(req.headers['x-freellm-cache'], req.headers['cache-control']);
+  const cacheInput = { model: requestedModel, messages, temperature, top_p, max_tokens, tools, tool_choice };
   const cacheKey = (cacheActive(cacheDirective) && isCacheableTemperature(temperature))
-    ? computeCacheKey({ model: requestedModel, messages, temperature, top_p, max_tokens, tools, tool_choice })
+    ? computeCacheKey(cacheInput)
     : null;
+
+  // Semantic state, filled lazily on an exact miss and reused when storing the
+  // fresh answer so the new entry is itself semantically searchable.
+  let semanticBucket: string | null = null;
+  let reqEmbedding: number[] | undefined;
+
+  const serveCacheHit = (
+    hit: { body: unknown; platform: string; modelId: string; keyId: number | null; promptTokens: number; completionTokens: number },
+    tag: 'HIT' | 'HIT-SEMANTIC',
+  ) => {
+    const routedVia = `${hit.platform}/${hit.modelId}`;
+    // A hit consumes NO provider quota, so recordRequest/recordTokens are
+    // deliberately NOT called — only the analytics row is written, tagged with
+    // the originating route so savings still attribute correctly.
+    if (stream) {
+      replayCachedCompletion(res, hit.body, routedVia, tag);
+    } else {
+      res.setHeader('X-Routed-Via', routedVia);
+      res.setHeader('X-FreeLLM-Cache', tag);
+      res.json(hit.body);
+    }
+    logRequest(hit.platform, hit.modelId, hit.keyId ?? 0, 'success', hit.promptTokens, hit.completionTokens, Date.now() - start, null, null, pinnedModelId);
+  };
 
   if (cacheKey) {
     const hit = getCachedResponse(cacheKey);
     if (hit) {
-      const routedVia = `${hit.platform}/${hit.modelId}`;
-      // A hit consumes NO provider quota, so recordRequest/recordTokens are
-      // deliberately NOT called — only the analytics row is written, tagged with
-      // the originating route so savings still attribute correctly.
-      if (stream) {
-        replayCachedCompletion(res, hit.body, routedVia);
-      } else {
-        res.setHeader('X-Routed-Via', routedVia);
-        res.setHeader('X-FreeLLM-Cache', 'HIT');
-        res.json(hit.body);
-      }
-      logRequest(hit.platform, hit.modelId, hit.keyId ?? 0, 'success', hit.promptTokens, hit.completionTokens, Date.now() - start, null, null, pinnedModelId);
+      serveCacheHit(hit, 'HIT');
       return;
+    }
+
+    // Exact miss → optional semantic fallback. Skipped for tool/vision turns
+    // (answers too context-bound to substitute) and silently disabled when no
+    // embeddings key is configured (runEmbeddings throws → caught).
+    if (isSemanticEnabled() && !wantsTools && !hasImage) {
+      semanticBucket = computeParamsBucket(cacheInput);
+      try {
+        const emb = await runEmbeddings(semanticFamily(), [semanticText(messages)]);
+        reqEmbedding = emb.vectors[0];
+      } catch {
+        reqEmbedding = undefined; // embeddings unavailable — semantic off this turn
+      }
+      if (reqEmbedding) {
+        const sem = findSemanticMatch(semanticBucket, reqEmbedding);
+        if (sem) {
+          serveCacheHit(sem, 'HIT-SEMANTIC');
+          return;
+        }
+      }
     }
   }
 
@@ -1021,8 +1060,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
           // Cache the assembled stream as one complete completion, so an
           // identical later request — streamed OR not — can be served from
-          // cache (replayCachedCompletion fans it back out to SSE).
-          if (cacheKey && (cachedContent.length > 0 || completedCalls.length > 0)) {
+          // cache (replayCachedCompletion fans it back out to SSE). Skip a
+          // truncated turn (finish_reason 'length'): a cut-off answer must not
+          // become the permanent cached reply.
+          if (cacheKey && finish !== 'length' && (cachedContent.length > 0 || completedCalls.length > 0)) {
             storeCachedResponse(cacheKey, {
               body: {
                 id: lastMeta.id ?? `chatcmpl-${Date.now()}`,
@@ -1049,6 +1090,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
               keyId: route.keyId,
               promptTokens: estimatedInputTokens + injectedHandoffTokens,
               completionTokens: totalOutputTokens,
+              embedding: reqEmbedding,
+              bucket: semanticBucket ?? undefined,
             });
           }
 
@@ -1143,8 +1186,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
         // Cache the freshly-generated answer so an identical later request is
         // served without spending another free-tier slot. Best-effort and
-        // post-response, so it can never delay or break the reply.
-        if (cacheKey) {
+        // post-response, so it can never delay or break the reply. A truncated
+        // turn (finish_reason 'length') is NOT cached — replaying a cut-off
+        // answer forever would be worse than regenerating.
+        if (cacheKey && result.choices?.[0]?.finish_reason !== 'length') {
           storeCachedResponse(cacheKey, {
             body: outboundBody,
             platform: route.platform,
@@ -1152,6 +1197,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             keyId: route.keyId,
             promptTokens: result.usage?.prompt_tokens ?? 0,
             completionTokens: result.usage?.completion_tokens ?? 0,
+            embedding: reqEmbedding,
+            bucket: semanticBucket ?? undefined,
           });
         }
 

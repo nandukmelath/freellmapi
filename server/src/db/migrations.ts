@@ -148,7 +148,14 @@ function createTables(db: Database.Database) {
       completion_tokens INTEGER NOT NULL DEFAULT 0,
       hit_count INTEGER NOT NULL DEFAULT 0,
       created_at_ms INTEGER NOT NULL,
-      last_hit_at_ms INTEGER
+      last_hit_at_ms INTEGER,
+      -- Semantic cache (services/cache.ts): embedding is the request's message
+      -- vector (JSON number[]) and bucket groups entries that share every
+      -- non-message parameter (model/tools/sampling), so a semantic search only
+      -- ever compares vectors that are safe to substitute for one another. Both
+      -- NULL unless RESPONSE_CACHE_SEMANTIC is on and an embeddings key exists.
+      embedding TEXT,
+      bucket TEXT
     );
 
     -- Dashboard accounts (email + password) gating the /api/* admin surface (#35).
@@ -180,6 +187,24 @@ function createTables(db: Database.Database) {
   ensureModelsKeyIdColumn(db);
   ensureRequestTtfbColumn(db);
   ensureRequestRequestedModelColumn(db);
+  ensureResponseCacheSemanticColumns(db);
+}
+
+// Semantic cache columns on response_cache (services/cache.ts). Added here
+// rather than in the CREATE TABLE's index block because an install created
+// before semantic caching shipped already has the table WITHOUT these columns —
+// the ALTERs (and the bucket index that depends on `bucket`) must run after the
+// table exists. Fresh DBs get the columns from CREATE TABLE and just skip the
+// ALTERs.
+function ensureResponseCacheSemanticColumns(db: Database.Database) {
+  const columns = db.prepare('PRAGMA table_info(response_cache)').all() as { name: string }[];
+  if (!columns.some(col => col.name === 'embedding')) {
+    db.prepare('ALTER TABLE response_cache ADD COLUMN embedding TEXT').run();
+  }
+  if (!columns.some(col => col.name === 'bucket')) {
+    db.prepare('ALTER TABLE response_cache ADD COLUMN bucket TEXT').run();
+  }
+  db.prepare('CREATE INDEX IF NOT EXISTS idx_response_cache_bucket ON response_cache(bucket)').run();
 }
 
 // `requested_model` is the model id the CLIENT pinned in the request body.

@@ -76,6 +76,31 @@ export function cacheMaxEntries(): number {
   return Math.floor(envNum('RESPONSE_CACHE_MAX_ENTRIES', 5000));
 }
 
+// ── Semantic cache ──
+// When on, an exact miss falls back to a nearest-neighbour search over cached
+// requests that share the SAME non-message params (the "bucket"), returning a
+// stored answer when the prompt is semantically close enough. Off by default,
+// and additionally a no-op unless an embeddings provider key exists (the proxy
+// swallows the embed error and skips semantic for that request).
+
+/** Master switch for the semantic layer (separate from the exact cache). */
+export function isSemanticEnabled(): boolean {
+  return envFlag('RESPONSE_CACHE_SEMANTIC', false);
+}
+
+/** Minimum cosine similarity to accept a semantic hit. Deliberately high — a
+ *  too-low threshold would serve a different question's answer. Default 0.95. */
+export function semanticThreshold(): number {
+  const t = envNum('RESPONSE_CACHE_SEMANTIC_THRESHOLD', 0.95);
+  return t > 1 ? 1 : t; // clamp; envNum already floors at 0
+}
+
+/** Embedding family used to vectorize prompts ('auto' = the configured default). */
+export function semanticFamily(): string {
+  const raw = process.env.RESPONSE_CACHE_SEMANTIC_FAMILY;
+  return raw && raw.trim() !== '' ? raw.trim() : 'auto';
+}
+
 // A request is cacheable only when its temperature is omitted (caller accepts
 // the provider default and is fine with a stable answer) or at/below the cap.
 export function isCacheableTemperature(temperature?: number): boolean {
@@ -136,13 +161,16 @@ export interface CacheKeyInput {
   tool_choice?: unknown;
 }
 
+function normModel(model: string | undefined): string {
+  // Omitted and the explicit "auto" sentinel mean the same thing (let the router
+  // decide), so they must share a cache bucket.
+  return !model || model === 'auto' ? 'auto' : model;
+}
+
 export function computeCacheKey(input: CacheKeyInput): string {
-  // Normalize the model field: omitted and the explicit "auto" sentinel mean the
-  // same thing (let the router decide), so they must share a cache bucket.
-  const model = !input.model || input.model === 'auto' ? 'auto' : input.model;
   const canonical = stableStringify({
     v: 1, // bump to invalidate every entry if the cached shape ever changes
-    model,
+    model: normModel(input.model),
     messages: input.messages,
     temperature: input.temperature,
     top_p: input.top_p,
@@ -151,6 +179,38 @@ export function computeCacheKey(input: CacheKeyInput): string {
     tool_choice: input.tool_choice,
   });
   return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
+// The semantic "bucket": a hash of every part of the request EXCEPT the
+// messages. Two requests in the same bucket differ only in prompt wording, so
+// one's cached answer is a legitimate substitute for the other if the prompts
+// are close enough — the bucket guarantees we never compare across different
+// models, tool sets, or sampling settings.
+export function computeParamsBucket(input: CacheKeyInput): string {
+  const canonical = stableStringify({
+    v: 1,
+    model: normModel(input.model),
+    temperature: input.temperature,
+    top_p: input.top_p,
+    max_tokens: input.max_tokens,
+    tools: input.tools,
+    tool_choice: input.tool_choice,
+  });
+  return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
+// Cosine similarity of two equal-length vectors. Returns -1 for mismatched or
+// zero-magnitude vectors (treated as "not similar").
+export function cosineSimilarity(a: number[], b: number[]): number {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length === 0 || a.length !== b.length) return -1;
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  if (na === 0 || nb === 0) return -1;
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
 }
 
 // ── Read / write ──
@@ -221,6 +281,80 @@ export function getCachedResponse(cacheKey: string, now = Date.now()): CachedRes
   };
 }
 
+interface SemanticRow extends CacheRow {
+  cache_key: string;
+  embedding: string | null;
+}
+
+/**
+ * Nearest-neighbour lookup for the semantic cache. Scans cached entries that
+ * share `bucket` (so every candidate is parameter-compatible), scores each by
+ * cosine similarity to `embedding`, and returns the best match at/above the
+ * configured threshold. Expired rows are skipped and purged. Returns null when
+ * nothing clears the bar — the caller then generates fresh.
+ */
+export function findSemanticMatch(bucket: string, embedding: number[], now = Date.now()): CachedResponse | null {
+  if (!bucket || !Array.isArray(embedding) || embedding.length === 0) return null;
+
+  const rows = withDb(db =>
+    db.prepare(`
+      SELECT cache_key, response_json, platform, model_id, key_id, prompt_tokens, completion_tokens, created_at_ms, embedding
+        FROM response_cache
+       WHERE bucket = ? AND embedding IS NOT NULL
+    `).all(bucket) as SemanticRow[],
+  );
+  if (!rows || rows.length === 0) return null;
+
+  const ttl = cacheTtlMs();
+  const threshold = semanticThreshold();
+  const expiredKeys: string[] = [];
+  let best: { row: SemanticRow; score: number } | null = null;
+
+  for (const row of rows) {
+    if (now - row.created_at_ms > ttl) { expiredKeys.push(row.cache_key); continue; }
+    let vec: number[];
+    try {
+      vec = JSON.parse(row.embedding!);
+    } catch {
+      expiredKeys.push(row.cache_key); // corrupt embedding — drop it
+      continue;
+    }
+    const score = cosineSimilarity(embedding, vec);
+    if (score >= threshold && (!best || score > best.score)) best = { row, score };
+  }
+
+  if (expiredKeys.length > 0) {
+    withDb(db => {
+      const del = db.prepare('DELETE FROM response_cache WHERE cache_key = ?');
+      for (const k of expiredKeys) del.run(k);
+    });
+  }
+
+  if (!best) return null;
+
+  let body: unknown;
+  try {
+    body = JSON.parse(best.row.response_json);
+  } catch {
+    withDb(db => db.prepare('DELETE FROM response_cache WHERE cache_key = ?').run(best!.row.cache_key));
+    return null;
+  }
+
+  withDb(db =>
+    db.prepare('UPDATE response_cache SET hit_count = hit_count + 1, last_hit_at_ms = ? WHERE cache_key = ?')
+      .run(now, best!.row.cache_key),
+  );
+
+  return {
+    body,
+    platform: best.row.platform,
+    modelId: best.row.model_id,
+    keyId: best.row.key_id,
+    promptTokens: best.row.prompt_tokens,
+    completionTokens: best.row.completion_tokens,
+  };
+}
+
 export interface StoreInput {
   body: unknown;
   platform: string;
@@ -228,6 +362,10 @@ export interface StoreInput {
   keyId: number | null;
   promptTokens: number;
   completionTokens: number;
+  // Semantic columns — set together (or both omitted). embedding is the
+  // request's message vector; bucket scopes which entries it may match.
+  embedding?: number[];
+  bucket?: string;
 }
 
 /**
@@ -244,11 +382,14 @@ export function storeCachedResponse(cacheKey: string, input: StoreInput, now = D
     return; // unserializable body — skip silently
   }
 
+  const embeddingJson = input.embedding ? JSON.stringify(input.embedding) : null;
+  const bucket = input.bucket ?? null;
+
   withDb(db => {
     db.prepare(`
       INSERT INTO response_cache
-        (cache_key, response_json, platform, model_id, key_id, prompt_tokens, completion_tokens, hit_count, created_at_ms, last_hit_at_ms)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, NULL)
+        (cache_key, response_json, platform, model_id, key_id, prompt_tokens, completion_tokens, hit_count, created_at_ms, last_hit_at_ms, embedding, bucket)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?)
       ON CONFLICT(cache_key) DO UPDATE SET
         response_json = excluded.response_json,
         platform = excluded.platform,
@@ -258,10 +399,12 @@ export function storeCachedResponse(cacheKey: string, input: StoreInput, now = D
         completion_tokens = excluded.completion_tokens,
         created_at_ms = excluded.created_at_ms,
         hit_count = 0,
-        last_hit_at_ms = NULL
+        last_hit_at_ms = NULL,
+        embedding = excluded.embedding,
+        bucket = excluded.bucket
     `).run(
       cacheKey, json, input.platform, input.modelId, input.keyId,
-      input.promptTokens, input.completionTokens, now,
+      input.promptTokens, input.completionTokens, now, embeddingJson, bucket,
     );
 
     // Evict oldest beyond the cap. Cheap because the count only drifts by one

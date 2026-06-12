@@ -2,6 +2,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { initDb } from '../../db/index.js';
 import {
   computeCacheKey,
+  computeParamsBucket,
+  cosineSimilarity,
+  findSemanticMatch,
   getCachedResponse,
   storeCachedResponse,
   getCacheStats,
@@ -18,6 +21,9 @@ const CACHE_ENV = [
   'RESPONSE_CACHE_TTL_SECONDS',
   'RESPONSE_CACHE_MAX_TEMPERATURE',
   'RESPONSE_CACHE_MAX_ENTRIES',
+  'RESPONSE_CACHE_SEMANTIC',
+  'RESPONSE_CACHE_SEMANTIC_THRESHOLD',
+  'RESPONSE_CACHE_SEMANTIC_FAMILY',
 ] as const;
 
 function msg(role: ChatMessage['role'], content: string): ChatMessage {
@@ -221,5 +227,98 @@ describe('response cache', () => {
       expect(cacheActive('default')).toBe(true);
       expect(cacheActive('off')).toBe(false);
     });
+  });
+
+  describe('computeParamsBucket', () => {
+    it('ignores message content but reacts to params', () => {
+      const a = computeParamsBucket({ model: 'auto', messages: [msg('user', 'x')], temperature: 0.2 });
+      const b = computeParamsBucket({ model: 'auto', messages: [msg('user', 'totally different')], temperature: 0.2 });
+      const c = computeParamsBucket({ model: 'auto', messages: [msg('user', 'x')], temperature: 0.9 });
+      expect(a).toBe(b);   // same params, different prompt → same bucket
+      expect(a).not.toBe(c); // different temperature → different bucket
+    });
+  });
+
+  describe('cosineSimilarity', () => {
+    it('is 1 for identical, ~0 for orthogonal, -1 for invalid', () => {
+      expect(cosineSimilarity([1, 0, 0], [1, 0, 0])).toBeCloseTo(1, 6);
+      expect(cosineSimilarity([1, 0], [0, 1])).toBeCloseTo(0, 6);
+      expect(cosineSimilarity([1, 2], [2, 4])).toBeCloseTo(1, 6); // scale-invariant
+      expect(cosineSimilarity([1, 0], [1, 0, 0])).toBe(-1); // length mismatch
+      expect(cosineSimilarity([0, 0], [1, 1])).toBe(-1); // zero vector
+    });
+  });
+});
+
+// Semantic search runs against the DB, so it gets its own suite with a fresh
+// in-memory DB. Embeddings are supplied directly (no network) to keep it
+// deterministic — the proxy is what actually calls runEmbeddings.
+describe('findSemanticMatch', () => {
+  const saved: Record<string, string | undefined> = {};
+  const BUCKET = 'bucket-1';
+
+  const storeWithVec = (key: string, text: string, vec: number[], bucket = BUCKET, now?: number) =>
+    storeCachedResponse(key, {
+      body: sampleBody(text),
+      platform: 'groq',
+      modelId: 'llama-3.3-70b',
+      keyId: 1,
+      promptTokens: 10,
+      completionTokens: 5,
+      embedding: vec,
+      bucket,
+    }, now);
+
+  beforeEach(() => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    for (const k of ['RESPONSE_CACHE_SEMANTIC_THRESHOLD', 'RESPONSE_CACHE_TTL_SECONDS']) saved[k] = process.env[k];
+    initDb(':memory:');
+  });
+
+  afterEach(() => {
+    for (const k of ['RESPONSE_CACHE_SEMANTIC_THRESHOLD', 'RESPONSE_CACHE_TTL_SECONDS']) {
+      if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]!;
+    }
+  });
+
+  it('returns the nearest entry above the threshold', () => {
+    process.env.RESPONSE_CACHE_SEMANTIC_THRESHOLD = '0.9';
+    storeWithVec('k1', 'about cats', [1, 0, 0]);
+    storeWithVec('k2', 'about dogs', [0, 1, 0]);
+    // Query very close to k1.
+    const hit = findSemanticMatch(BUCKET, [0.99, 0.01, 0]);
+    expect(hit).not.toBeNull();
+    expect((hit!.body as any).choices[0].message.content).toBe('about cats');
+  });
+
+  it('returns null when nothing clears the threshold', () => {
+    process.env.RESPONSE_CACHE_SEMANTIC_THRESHOLD = '0.95';
+    storeWithVec('k1', 'about cats', [1, 0, 0]);
+    // Orthogonal query → cosine 0 < 0.95.
+    expect(findSemanticMatch(BUCKET, [0, 1, 0])).toBeNull();
+  });
+
+  it('never matches across buckets (param isolation)', () => {
+    process.env.RESPONSE_CACHE_SEMANTIC_THRESHOLD = '0.5';
+    storeWithVec('k1', 'cats', [1, 0, 0], 'bucket-A');
+    // Same vector, different bucket → no match.
+    expect(findSemanticMatch('bucket-B', [1, 0, 0])).toBeNull();
+  });
+
+  it('skips and purges entries past the TTL', () => {
+    process.env.RESPONSE_CACHE_SEMANTIC_THRESHOLD = '0.9';
+    process.env.RESPONSE_CACHE_TTL_SECONDS = '1';
+    const t0 = 1_700_000_000_000;
+    storeWithVec('k1', 'cats', [1, 0, 0], BUCKET, t0);
+    // 2s later → expired.
+    expect(findSemanticMatch(BUCKET, [1, 0, 0], t0 + 2000)).toBeNull();
+    expect(getCacheStats().entries).toBe(0); // purged
+  });
+
+  it('counts a semantic hit', () => {
+    process.env.RESPONSE_CACHE_SEMANTIC_THRESHOLD = '0.9';
+    storeWithVec('k1', 'cats', [1, 0, 0]);
+    findSemanticMatch(BUCKET, [1, 0, 0]);
+    expect(getCacheStats().totalHits).toBe(1);
   });
 });
