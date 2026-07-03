@@ -43,7 +43,12 @@ COPY --from=build --chown=node:node /app/client/dist ./client/dist
 
 RUN mkdir -p /app/server/data && chown -R node:node /app/server/data
 
-USER node
+# Run as root (do NOT drop to `node`). A persistent volume mounted at
+# /app/server/data — e.g. a k8s/Sealos PVC — arrives owned by root:root, so a
+# non-root `node` process cannot create the SQLite file ("unable to open
+# database file"). Root can write regardless of how the volume is mounted.
+# This is a single-user LLM proxy, so running as root is an acceptable trade.
+# USER node
 
 EXPOSE 3001
 VOLUME ["/app/server/data"]
